@@ -41,25 +41,6 @@ def restart_orchagent(duthosts, enum_rand_one_per_hwsku_frontend_hostname, enum_
         """ VOQ type chassis does not support warm restart of orchagent. Use restart service here """
         duthost.shell("sudo systemctl reset-failed")
         duthost.shell("sudo systemctl restart {}".format(asic.get_service_name("swss")))
-        # make sure all critical services are up
-        assert wait_until(600, 5, 30, duthost.critical_services_fully_started), (
-            "Not all critical services are fully started after restarting orchagent. "
-        )
-
-        # wait for ports to be up and lldp neighbor information has been received by dut
-        assert wait_until(300, 20, 60,
-                          lambda: pre_lldpctl_facts == get_num_lldpctl_facts(duthost, enum_frontend_asic_index)), (
-            "Cannot get all lldp entries. "
-            "Expected LLDP entries: {}\n"
-            "Current LLDP entries: {}"
-        ).format(
-            pre_lldpctl_facts,
-            get_num_lldpctl_facts(duthost, enum_frontend_asic_index)
-        )
-
-        # add delay here to make sure neighbor devices also have received lldp packets from dut and neighbor
-        # information has been updated properly
-        time.sleep(30)
     else:
         logger.info("Restarting program '{}' in container '{}'".format(program_name, container_name))
         # disable feature autorestart. Feature is enabled/disabled at feature level and
@@ -76,6 +57,27 @@ def restart_orchagent(duthosts, enum_rand_one_per_hwsku_frontend_hostname, enum_
         )
 
         duthost.shell("docker exec {} supervisorctl start {}".format(container_name, program_name))
+
+    # make sure all critical services are up
+    assert wait_until(600, 5, 30, duthost.critical_services_fully_started), (
+        "Not all critical services are fully started after restarting orchagent. "
+    )
+
+    # wait for ports to be up and lldp neighbor information has been received by dut
+    assert wait_until(300, 20, 60,
+                        lambda: pre_lldpctl_facts == get_num_lldpctl_facts(duthost, enum_frontend_asic_index)), (
+        "Cannot get all lldp entries. "
+        "Expected LLDP entries: {}\n"
+        "Current LLDP entries: {}"
+    ).format(
+        pre_lldpctl_facts,
+        get_num_lldpctl_facts(duthost, enum_frontend_asic_index)
+    )
+
+    # add delay here to make sure neighbor devices also have received lldp packets from dut and neighbor
+    # information has been updated properly
+    time.sleep(30)
+
     yield
 
 
