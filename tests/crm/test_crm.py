@@ -255,6 +255,17 @@ def get_acl_tbl_key(asichost):
     return "CRM:ACL_TABLE_STATS:{0}".format(oid.replace("oid:", ""))
 
 
+def count_threshold_log_matches(duthost, expect_regex):
+    """
+    Return the number of syslog lines matching the expected CRM threshold message.
+    /var/log/syslog is only readable by root, so this has to run under sudo.
+    """
+    cmd = "sudo grep -c -E '{}' /var/log/syslog".format(expect_regex)
+    # grep exits 1 when there is no match, so errors are ignored and an empty result counts as 0.
+    result = duthost.shell(cmd, module_ignore_errors=True)
+    return int(result["stdout"].strip() or 0)
+
+
 def verify_thresholds(duthost, asichost, **kwargs):
     """
     Verifies that WARNING message logged if there are any resources that exceeds a pre-defined threshold value.
@@ -310,9 +321,13 @@ def verify_thresholds(duthost, asichost, **kwargs):
         cmd = template.render(**kwargs)
 
         with loganalyzer:
+            expect_regex = loganalyzer.expect_regex[0]
+            matches_before = count_threshold_log_matches(duthost, expect_regex)
             asichost.command(cmd)
-            # Make sure CRM counters updated
-            wait_until(CRM_UPDATE_TIME, CRM_POLLING_INTERVAL, 0, lambda: True)
+            # crmd logs the threshold message on its own polling cycle, so wait for that message
+            # to reach syslog before leaving the block and letting LogAnalyzer analyze.
+            wait_until(CRM_UPDATE_TIME, CRM_POLLING_INTERVAL, 0,
+                       lambda: count_threshold_log_matches(duthost, expect_regex) > matches_before)
 
 
 def get_crm_stats(cmd, duthost):
