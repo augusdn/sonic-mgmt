@@ -699,25 +699,33 @@ def backup_bgp_config(duthost):
         apply_default_bgp_config(duthost)
 
 
-def get_running_bgp_asn(duthost, namespace=None):
-    """Return the AS the DUT is actually running BGP in, or None if it cannot be read.
+def _bgpmon_peer_exists(asichost, peer_addr):
+    neighbors = json.loads(asichost.run_vtysh("-c 'show bgp neighbors json'")["stdout"])
+    pt_assert(isinstance(neighbors, dict), "BGP neighbors output must be a dictionary")
+    peer_key = str(ipaddress.ip_address(peer_addr))
+    return peer_key in neighbors or peer_addr in neighbors
 
-    Reading it from the device avoids having to know which config field a given
-    topology keeps the local AS in. On a confederation member, BGP_DEVICE_GLOBAL
-    holds the confederation identifier, which is what external peers see and is
-    not the AS bgpd runs with.
-    """
-    try:
-        asichost = duthost.asic_instance_from_namespace(namespace)
-        summary = json.loads(asichost.run_vtysh("-c 'show bgp summary json'")['stdout'])
-    except Exception:
-        logger.warning("Could not read the running BGP AS from the DUT")
-        return None
-    for af in ('ipv4Unicast', 'ipv6Unicast'):
-        local_as = summary.get(af, {}).get('as')
-        if local_as:
-            return local_as
-    return None
+
+def _get_bgpmon_peer_asns(asichost, peer_addr):
+    """Return the configured DUT local/remote ASN pair for the monitor peer."""
+    neighbors = json.loads(asichost.run_vtysh("-c 'show bgp neighbors json'")["stdout"])
+    pt_assert(isinstance(neighbors, dict), "BGP neighbors output must be a dictionary")
+
+    peer_key = str(ipaddress.ip_address(peer_addr))
+    neighbor = neighbors.get(peer_key)
+    if neighbor is None and peer_key != peer_addr:
+        neighbor = neighbors.get(peer_addr)
+    pt_assert(isinstance(neighbor, dict), "BGP monitor peer {} was not found".format(peer_key))
+
+    asns = []
+    for field in ("localAs", "remoteAs"):
+        asn = neighbor.get(field)
+        pt_assert(
+            isinstance(asn, int) and not isinstance(asn, bool) and 0 < asn <= 0xFFFFFFFF,
+            "BGP monitor peer {} has invalid {}".format(peer_key, field)
+        )
+        asns.append(asn)
+    return tuple(asns)
 
 
 @pytest.fixture(scope="module")
@@ -729,10 +737,10 @@ def bgpmon_setup_teardown(ptfhost, duthosts, enum_rand_one_per_hwsku_frontend_ho
     dut_lo_addr = connection["loopback_ip"].split("/")[0]
     peer_addr = connection['neighbor_addr'].split("/")[0]
     mg_facts = duthost.minigraph_facts(host=duthost.hostname)['ansible_facts']
-    # BGPMonitor is an iBGP session, so it has to use the AS the DUT actually
-    # runs BGP in. Ask the device rather than picking a config field, and fall
-    # back to the minigraph if it cannot be read.
-    asn = get_running_bgp_asn(duthost, connection['namespace']) or mg_facts['minigraph_bgp_asn']
+    asn = mg_facts['minigraph_bgp_asn']
+    confed_asn = duthost.get_bgp_confed_asn()
+    if confed_asn:
+        asn = confed_asn
     # TODO: Add a common method to load BGPMON config for test_bgpmon and test_traffic_shift
     logger.info("Configuring bgp monitor session on DUT")
     bgpmon_args = {
@@ -749,6 +757,19 @@ def bgpmon_setup_teardown(ptfhost, duthosts, enum_rand_one_per_hwsku_frontend_ho
     logger.info("Starting bgpmon on DUT")
     asichost = duthost.asic_instance_from_namespace(connection['namespace'])
     asichost.write_to_config_db(BGPMON_CONFIG_FILE)
+
+    monitor_key = "BGP_MONITORS|{}".format(peer_addr)
+    peer_asns_resolved = False
+    try:
+        pt_assert(
+            wait_until(30, 1, 0, _bgpmon_peer_exists, asichost, peer_addr),
+            "BGP monitor peer {} did not appear in FRR".format(peer_addr)
+        )
+        dut_local_asn, dut_remote_asn = _get_bgpmon_peer_asns(asichost, peer_addr)
+        peer_asns_resolved = True
+    finally:
+        if not peer_asns_resolved:
+            asichost.run_sonic_db_cli_cmd("CONFIG_DB DEL '{}'".format(monitor_key))
 
     logger.info("Starting bgp monitor session on PTF")
 
@@ -771,8 +792,8 @@ def bgpmon_setup_teardown(ptfhost, duthosts, enum_rand_one_per_hwsku_frontend_ho
                    local_ip=peer_addr,
                    router_id=router_id,
                    peer_ip=dut_lo_addr,
-                   local_asn=asn,
-                   peer_asn=asn,
+                   local_asn=dut_remote_asn,
+                   peer_asn=dut_local_asn,
                    port=BGP_MONITOR_PORT,
                    dump_script=CUSTOM_DUMP_SCRIPT_DEST)
 
@@ -794,7 +815,7 @@ def bgpmon_setup_teardown(ptfhost, duthosts, enum_rand_one_per_hwsku_frontend_ho
 
     yield connection
     # Cleanup bgp monitor
-    asichost.run_sonic_db_cli_cmd("CONFIG_DB DEL 'BGP_MONITORS|{}'".format(peer_addr))
+    asichost.run_sonic_db_cli_cmd("CONFIG_DB DEL '{}'".format(monitor_key))
 
     ptfhost.exabgp(name=BGP_MONITOR_NAME, state="absent")
     ptfhost.file(path=CUSTOM_DUMP_SCRIPT_DEST, state="absent")
